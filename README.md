@@ -20,7 +20,6 @@ com o [Locust](https://locust.io), analisando o impacto da quantidade de usuári
 6. [Resultados](#6-resultados)
 7. [Análise: respostas às questões](#7-análise-respostas-às-questões)
 8. [Conclusões](#8-conclusões)
-9. [Limitações](#9-limitações)
 
 ---
 
@@ -31,28 +30,24 @@ com o [Locust](https://locust.io), analisando o impacto da quantidade de usuári
 ├── docker-compose.yml        # stack do PetClinic (imagens 3.4.1 fixadas)
 ├── app/                      # projeto Python (uv)
 │   ├── locustfile.py         # os dois perfis de carga
-│   ├── run_experiments.py    # executa as 60 execuções e coleta CPU/memória
-│   ├── analyze.py            # agrega os CSVs e gera tabelas e gráficos
-│   ├── diagnostico.py        # execução extra que monitora pool de conexões e GC do customers-service
+│   ├── executar_testes.py    # executa as 60 execuções, mede a CPU e salva os CSVs
+│   ├── gerar_graficos.py     # gera os gráficos a partir dos CSVs
 │   └── pyproject.toml / uv.lock
 ├── results/
-│   ├── raw/<perfil>/<cenário>/repNN/   # CSVs brutos de cada execução
-│   ├── tabelas/                        # tabelas agregadas (resumo, endpoints, degradacao, cpu .csv)
-│   ├── graficos/                       # gráficos (.png)
-│   └── diagnostico/                    # saída do diagnostico.py
+│   ├── resultados.csv        # uma linha por execução e operação
+│   ├── cpu.csv               # CPU média de cada serviço em cada execução
+│   ├── media.csv             # média das 10 repetições, por perfil, cenário e operação
+│   ├── media_cpu.csv         # média das 10 repetições da CPU, por perfil, cenário e serviço
+│   ├── locust/               # CSVs originais do Locust de cada execução
+│   └── graficos/             # os 9 gráficos
 └── docs/trabalho06.pdf       # enunciado
 ```
 
-Cada pasta `results/raw/<perfil>/<cenário>/repNN/` contém:
-
-| Arquivo | Conteúdo |
+| Arquivo | Colunas |
 |---|---|
-| `locust_stats.csv` | estatísticas finais por endpoint, só da janela de medição |
-| `locust_stats_history.csv` | série temporal (1 linha por segundo por endpoint), inclusive o aquecimento |
-| `locust_failures.csv` / `locust_exceptions.csv` | falhas e exceções registradas |
-| `containers.csv` | amostras de CPU (%) e memória (MiB) de cada container (`docker stats`) |
-| `meta.json` | parâmetros e horários da execução |
-| `locust.log` | saída do Locust |
+| `resultados.csv` e `media.csv` | perfil, cenário, usuários, repetição (só no `resultados.csv`), operação (`Total` = todas), requisições, falhas, taxa de falhas (%), tempo médio (ms), P95 (ms), vazão (req/s) |
+| `cpu.csv` e `media_cpu.csv` | perfil, cenário, usuários, repetição (só no `cpu.csv`), container, CPU (%) |
+| `locust/<perfil>_<cenário>_repNN_*.csv` | `_stats` (estatísticas finais), `_stats_history` (série temporal), `_failures` e `_exceptions` (erros) |
 
 ## 2. Ambiente
 
@@ -66,10 +61,8 @@ dividem os mesmos recursos.
 | Sistema operacional | Windows 11 Pro (build 26300) |
 | Docker | Docker Desktop, Engine 29.8.2 (backend WSL 2); VM com 32 CPUs e 15,2 GiB |
 | Aplicação | Spring PetClinic Microservices 3.4.1 (imagens `springcommunity/*:3.4.1`) |
-| Gerador de carga | Locust 2.46.7, Python 3.12 |
-| Análise | pandas 3.0, matplotlib 3.11 |
-
-Os dados de ambiente registrados durante a bateria estão em `results/raw/ambiente.json`.
+| Gerador de carga | Locust 2.46.7, Faker 40.43, Python 3.12.13 |
+| Análise | pandas 3.0.6, matplotlib 3.11.2 |
 
 ## 3. Aplicação e endpoints
 
@@ -104,10 +97,12 @@ todo o tráfego entra pelo api-gateway, que remove o prefixo (`StripPrefix=2`) e
 Detalhes da versão que importam para a análise:
 
 - **`GET /owners` não tem paginação** e carrega os pets de cada owner com `FetchType.EAGER`. O custo cresce
-  linearmente com o número de owners no banco, que aumenta a cada `POST /owners`.
+  com o número de owners no banco, que aumenta a cada `POST /owners`.
 - **`GET /vets` usa `@Cacheable`**: depois da primeira chamada, não consulta o banco.
-- O gateway aplica um **CircuitBreaker** (Resilience4j, timeout de 10 s) em todas as rotas. Quando o circuito
-  abre ou o tempo limite estoura, a resposta é **503** (fallback), contada como falha pelo Locust.
+- O gateway aplica um **circuit breaker** (Resilience4j) em todas as rotas, com limite de 10 s por requisição.
+  Ele é **um só para todas as rotas** (`defaultCircuitBreaker`): quando mais da metade das últimas 100 chamadas
+  falha, ele abre e o gateway passa a responder pelo fallback, sem chamar os serviços. Nos testes, o fallback
+  respondeu **405** aos GET e **503** ao POST, e o Locust conta as duas respostas como falha.
 - Todos os serviços exportam 100% dos traces para o Zipkin (`management.tracing.sampling.probability: 1`).
 
 ## 4. Como reproduzir
@@ -115,37 +110,26 @@ Detalhes da versão que importam para a análise:
 **Pré-requisitos:** Docker Desktop (ou Docker Engine + Compose v2), [uv](https://docs.astral.sh/uv/) e Git.
 
 ```bash
-# 1. Subir a aplicação (~1 min na primeira vez, para baixar as imagens)
-docker compose up -d --wait
-
-# 2. Instalar as dependências Python
+# 1. Instalar as dependências Python (com o Docker Desktop aberto)
 cd app
 uv sync
 
-# 3. Conferir os quatro endpoints pelo gateway
-uv run python run_experiments.py --check
+# 2. Bateria completa: 2 perfis x 3 cenários x 10 repetições = 60 execuções (~7 h)
+#    O próprio script sobe a aplicação (docker compose down + up) antes da primeira execução.
+uv run python executar_testes.py
 
-# 4. (Opcional) Teste rápido: 6 execuções curtas (15 s + 45 s), ~15 min, salvas em results/piloto/
-uv run python run_experiments.py --teste
-
-# 5. Bateria completa: 2 perfis x 3 cenários x 10 repetições = 60 execuções (~9 h)
-uv run python run_experiments.py
-
-# 6. (Opcional) Diagnóstico do customers-service no Perfil 2, cenário C (~8 min)
-uv run python diagnostico.py
-
-# 7. Gerar as tabelas (CSV) e os gráficos (PNG) em results/
-uv run python analyze.py
+# 3. Gerar os gráficos em results/graficos/
+uv run python gerar_graficos.py
 ```
 
-Os parâmetros (repetições, aquecimento, duração, cenários) ficam como constantes no início de
-[`app/run_experiments.py`](app/run_experiments.py).
+Os parâmetros (repetições, aquecimento, duração, cenários e serviços monitorados) ficam como constantes no
+início de [`app/executar_testes.py`](app/executar_testes.py). Se a bateria for interrompida, ela recomeça do
+zero na próxima chamada.
 
-Se a bateria for interrompida, basta rodar o passo 5 de novo: as execuções concluídas são puladas.
-
-Para usar a interface web do Locust (como no vídeo):
+Para usar a interface web do Locust (como no vídeo), com a aplicação no ar:
 
 ```bash
+docker compose up -d --wait
 cd app
 uv run locust -f locustfile.py PerfilLeitura --host http://127.0.0.1:8080   # abre em http://localhost:8089
 ```
@@ -185,8 +169,9 @@ são exatamente as porcentagens do enunciado:
 
 - Cada usuário espera de **1 a 3 s** (uniforme) entre requisições, simulando o tempo de reflexão de uma pessoa.
 - `GET /owners/{id}` sorteia um id entre os 10 owners iniciais e os criados durante a execução.
-- `POST /owners` gera dados aleatórios válidos (o telefone respeita `@Digits(integer = 12)`). Quando a resposta
-  é 201, o id do owner criado entra na lista usada pelo `GET /owners/{id}`.
+- `POST /owners` gera nomes e cidades com o Faker (`pt_BR`) e um telefone de 10 dígitos, que respeita a
+  validação `@Digits(integer = 12)`. Quando a resposta é 201, o id do owner criado entra na lista usada pelo
+  `GET /owners/{id}`.
 
 ### 5.2 Cenários e execuções
 
@@ -196,135 +181,151 @@ são exatamente as porcentagens do enunciado:
 | B (Moderado) | 80 | 1 min | 6 min | 10 usuários/s |
 | C (Elevado) | 150 | 1 min | 6 min | 10 usuários/s |
 
-2 perfis × 3 cenários × 10 repetições = **60 execuções** de 7 min cada.
+2 perfis × 3 cenários × 10 repetições = **60 execuções** de 7 min cada, feitas por
+[`app/executar_testes.py`](app/executar_testes.py).
 
 - **Descarte do aquecimento:** o locustfile zera as estatísticas do Locust (`stats.reset_all()`) ao fim do
-  1º minuto. O `locust_stats.csv` final, inclusive a vazão, reflete só os 6 min de medição. Todos os
+  1º minuto. O `_stats.csv` final de cada execução, inclusive a vazão, reflete só os 6 min de medição. Todos os
   usuários já estão ativos antes do fim do aquecimento (150 usuários a 10/s = 15 s).
-- **Repetições independentes:** antes de cada execução a stack inteira é recriada (`docker compose down` +
-  `up --wait`), e o script espera o gateway responder corretamente 5 vezes seguidas, com o banco de volta aos
-  10 owners iniciais. Sem isso, os owners criados numa execução deixariam o `GET /owners` da execução seguinte
-  mais lento, e o estado do gateway (cache do Eureka, circuit breaker) passaria de uma execução para outra.
 - **Ordem intercalada:** repetição → perfil → cenário (rep 1: Leitura A, B, C, Escrita A, B, C; rep 2: ...).
-  Variações lentas da máquina se espalham entre as configurações em vez de se concentrar numa delas.
-- **CPU e memória:** amostradas com `docker stats` durante toda a execução (~1 amostra a cada 2 s por
-  container); só as amostras após o aquecimento entram na média. A CPU é medida em % de **um** núcleo
-  (200% = dois núcleos inteiros).
+- **Sem reinício entre execuções:** a aplicação é iniciada **uma única vez**, antes da primeira execução
+  (`docker compose down` + `up --wait`). Em seguida, o script espera o gateway responder corretamente 5 vezes
+  seguidas e faz 100 chamadas ao `GET /vets` para limpar a janela do circuit breaker (ver [5.4](#54-teste-piloto-e-ajustes)).
+  As 59 execuções seguintes usam a mesma instância: os owners criados pelos POSTs **se acumulam** no banco em
+  memória, e o estado do circuit breaker passa de uma execução para a seguinte. A escolha reduziu a bateria
+  de ~8,5 h para ~7 h. O efeito disso nos resultados é analisado na [seção 6](#6-resultados).
+- **CPU:** o `docker stats` amostra o api-gateway, o customers-service e o vets-service durante toda a
+  execução (~1 amostra a cada 2 s por serviço); só as amostras após o aquecimento entram na média. A CPU é
+  medida em % de **um** núcleo (200% = dois núcleos inteiros).
 
 ### 5.3 Métricas e agregação
 
-| Métrica | Fonte |
+| Métrica | Fonte (`_stats.csv` de cada execução) |
 |---|---|
-| Tempo médio de resposta (ms) | `Average Response Time` do `locust_stats.csv` |
-| Tempo de resposta P95 (ms) | coluna `95%` do `locust_stats.csv` |
-| Vazão (req/s) | `Requests/s` do `locust_stats.csv` (requisições ÷ tempo de medição) |
-| Total de requisições | `Request Count` do `locust_stats.csv` |
+| Tempo médio de resposta (ms) | `Average Response Time` |
+| Tempo de resposta P95 (ms) | coluna `95%` |
+| Vazão (req/s) | `Requests/s` (requisições ÷ tempo de medição) |
+| Total de requisições | `Request Count` |
 | Taxa de falhas (%) | `Failure Count` ÷ `Request Count` × 100 |
 | CPU (%) por serviço | média das amostras do `docker stats` após o aquecimento |
 
-Para cada configuração (perfil × cenário) é calculada a **média e o desvio-padrão entre as 10 repetições**.
-O P95 reportado é a média dos P95 de cada execução. Tudo isso é feito por [`app/analyze.py`](app/analyze.py).
+Para cada configuração (perfil × cenário), o `media.csv` e o `media_cpu.csv` trazem a **média das
+10 repetições**. O P95 reportado é a média dos P95 de cada execução. As requisições que falharam entram em
+todas as métricas, inclusive no tempo de resposta e na vazão, como o Locust as registra.
 
 ### 5.4 Teste piloto e ajustes
 
-Antes da bateria, um piloto curto (1 repetição de cada configuração, 15 s de aquecimento + 45 s de medição)
-revelou três problemas no ambiente, todos corrigidos antes das medições oficiais:
+Antes da bateria, testes curtos revelaram três problemas no ambiente, todos corrigidos antes das medições:
 
 1. **`localhost` no Windows.** Cada conexão nova do Python para `http://localhost:8080` levava de 10 a 20 s,
    porque o nome resolve primeiro para IPv6 (`::1`), que o Docker Desktop não atende nessa porta. Com
    `http://127.0.0.1:8080` a mesma requisição leva ~20 ms. Todos os testes usam `127.0.0.1`.
 2. **OOM no api-gateway: a JVM não enxergava o limite do container.** Com o compose original, o gateway ficou
    no teto de 512 MiB desde o primeiro cenário e foi morto pelo kernel (`OOMKilled=true`) no cenário B
-   (80 usuários). Dobrar o limite não resolveu: ele chegou a 1024 MiB também. A causa é que a JVM 17.0.16 das
-   imagens não detecta o limite de memória no Docker Desktop/WSL 2 (`-Xlog:os+container` mostra
-   `controller memory is not enabled`) e se dimensiona pela RAM da VM inteira: heap máximo de 3,8 GiB num
-   container de 512 MiB. A correção foi informar o limite à JVM com `-XX:MaxRAM=1g` (heap máximo passa a
-   256 MiB, 25% do limite, como num Linux nativo) e manter o limite em 1 GiB, para dar folga à memória fora do heap.
-3. **Reiniciar só o customers-service contaminava a execução seguinte.** A ideia inicial era reiniciar apenas o
-   serviço com o banco. Mesmo depois de ele voltar a responder, o cache do Eureka no gateway oscilou ("No servers
-   available for service: customers-service") durante o aquecimento. Como o circuit breaker do gateway é **um só
-   para todas as rotas** (`defaultCircuitBreaker`), ele abriu, e o gateway passou a responder pelo fallback
-   (405/503) a todas as requisições, inclusive `GET /vets`. Por isso a stack inteira passou a ser recriada
-   entre execuções.
-
-Além disso, o script registra no `meta.json` de cada execução os containers que pararam ou sofreram OOM
-durante a medição (campo `containers_parados`).
+   (80 usuários). A JVM 17.0.16 das imagens não detecta o limite de memória no Docker Desktop/WSL 2
+   (`-Xlog:os+container` mostra `controller memory is not enabled`) e se dimensiona pela RAM da VM inteira:
+   heap máximo de 3,8 GiB num container de 512 MiB. A correção foi informar o limite à JVM com
+   `-XX:MaxRAM=1g` (heap máximo de 256 MiB, 25% do limite, como num Linux nativo) e manter o limite em 1 GiB,
+   para dar folga à memória fora do heap.
+3. **Falhas da subida "contaminavam" o circuit breaker.** Enquanto a aplicação sobe, a checagem de prontidão
+   gera falhas que ficam guardadas na janela de 100 chamadas do circuit breaker (o endpoint
+   `/actuator/circuitbreakers` mostrou cerca de 25 falhas em 35 chamadas logo após a subida). Quando a carga
+   começava, essas falhas antigas podiam abrir o circuito no primeiro segundo, gerando 100% de falhas sem relação
+   com o teste. A correção foram as 100 chamadas ao `GET /vets` depois da prontidão, que empurram as falhas para
+   fora da janela (o mesmo endpoint passou a mostrar 0 falhas em 100 chamadas).
 
 ## 6. Resultados
 
-As 60 execuções foram concluídas (10 por configuração), sem nenhum container parado ou morto por OOM.
-Valores = média ± desvio-padrão entre as 10 repetições, só na janela de medição de 6 min. As tabelas
-completas em CSV estão em [`results/tabelas/`](results/tabelas/) e os gráficos em [`results/graficos/`](results/graficos/).
+As 60 execuções foram concluídas e somaram **821.208 requisições, das quais 700.085 falharam (85,3%)**. Os
+valores são a média das 10 repetições, só na janela de medição de 6 min.
+
+> **Atenção ao ler os resultados.** Como a aplicação não foi reiniciada entre as execuções, os owners criados
+> se acumularam no banco e, a partir da 2ª ou 3ª repetição, o circuit breaker passou a recusar a maior parte
+> das requisições (seção 6.2). As respostas de erro do fallback são muito rápidas e entram nas médias de tempo
+> e de vazão. Por isso, a seção 6.5 mostra também a repetição 1, a única em que nenhum cenário teve falhas.
 
 ### 6.1 Visão geral
 
-| Perfil             | Cenário          | Tempo médio (ms)   | P95 (ms)   | Vazão (req/s)   | Requisições por execução   | Falhas (%)   | n   |
-|:-------------------|:-----------------|:-------------------|:-----------|:----------------|:---------------------------|:-------------|:----|
-| Perfil 1 (Leitura) | A · 30 usuários  | 9,5 ± 0,3          | 25 ± 1     | 14,90 ± 0,04    | 5.357 ± 15                 | 0,00 ± 0,00  | 10  |
-| Perfil 1 (Leitura) | B · 80 usuários  | 14,2 ± 0,2         | 44 ± 0     | 39,60 ± 0,11    | 14.224 ± 37                | 0,00 ± 0,00  | 10  |
-| Perfil 1 (Leitura) | C · 150 usuários | 17,9 ± 0,3         | 55 ± 1     | 74,04 ± 0,43    | 26.626 ± 56                | 0,00 ± 0,00  | 10  |
-| Perfil 2 (Escrita) | A · 30 usuários  | 20,0 ± 0,8         | 112 ± 4    | 14,83 ± 0,06    | 5.332 ± 20                 | 0,00 ± 0,00  | 10  |
-| Perfil 2 (Escrita) | B · 80 usuários  | 32,9 ± 0,6         | 191 ± 6    | 39,26 ± 0,11    | 14.113 ± 39                | 0,00 ± 0,00  | 10  |
-| Perfil 2 (Escrita) | C · 150 usuários | 106,8 ± 13,5       | 620 ± 94   | 70,97 ± 0,50    | 25.474 ± 174               | 0,00 ± 0,00  | 10  |
+| Perfil | Cenário | Tempo médio (ms) | P95 (ms) | Vazão (req/s) | Requisições por execução | Falhas (%) |
+|---|---|---|---|---|---|---|
+| Perfil 1 (Leitura) | A (30 usuários) | 666,7 | 3.833 | 12,07 | 4.337 | 70,1 |
+| Perfil 1 (Leitura) | B (80 usuários) | 658,8 | 1.718 | 34,06 | 12.236 | 79,2 |
+| Perfil 1 (Leitura) | C (150 usuários) | 184,6 | 371 | 68,88 | 24.742 | 89,1 |
+| Perfil 2 (Escrita) | A (30 usuários) | 259,0 | 1.667 | 13,33 | 4.789 | 49,3 |
+| Perfil 2 (Escrita) | B (80 usuários) | 519,7 | 1.717 | 34,38 | 12.350 | 78,1 |
+| Perfil 2 (Escrita) | C (150 usuários) | 355,9 | 1.122 | 65,99 | 23.668 | 88,8 |
 
-![Tempo médio de resposta por cenário](results/graficos/tempo_medio.png)
+![Tempo médio de resposta](results/graficos/tempo_medio.png)
 
-![Tempo de resposta P95 por cenário](results/graficos/p95.png)
+![Tempo de resposta P95](results/graficos/p95.png)
 
-![Vazão por cenário](results/graficos/vazao.png)
+![Vazão](results/graficos/vazao.png)
 
-![Total de requisições por execução](results/graficos/requisicoes.png)
+![Total de requisições por execução](results/graficos/total_requisicoes.png)
 
-**Falhas:** nenhuma em 911.251 requisições. A taxa foi de 0% em todas as 60 execuções, por isso não há
-gráfico de falhas.
+![Taxa de falhas](results/graficos/taxa_falhas.png)
 
-### 6.2 Por operação
+### 6.2 Falhas ao longo da bateria
 
-Fator de degradação = valor no cenário C ÷ valor no cenário A (a tabela completa por operação e cenário
-está em [`results/tabelas/endpoints.csv`](results/tabelas/endpoints.csv)):
+Taxa de falhas (%) de cada execução, na ordem em que foram feitas:
 
-| Perfil             | Endpoint         | Média A (ms)   | Média C (ms)   | Fator média (C/A)   | P95 A (ms)   | P95 C (ms)   | Fator P95 (C/A)   |
-|:-------------------|:-----------------|:---------------|:---------------|:--------------------|:-------------|:-------------|:------------------|
-| Perfil 2 (Escrita) | GET /owners/{id} | 3,1            | 57,9           | ×18,45              | 4            | 442          | ×110,50           |
-| Perfil 2 (Escrita) | POST /owners     | 3,2            | 57,7           | ×17,77              | 4            | 444          | ×111,00           |
-| Perfil 2 (Escrita) | GET /owners      | 86,3           | 360,3          | ×4,18               | 151          | 1.232        | ×8,16             |
-| Perfil 1 (Leitura) | GET /owners      | 16,8           | 36,4           | ×2,16               | 28           | 64           | ×2,29             |
-| Perfil 2 (Escrita) | GET /vets        | 4,5            | 3,9            | ×0,87               | 7            | 5            | ×0,75             |
-| Perfil 1 (Leitura) | GET /owners/{id} | 3,0            | 2,3            | ×0,76               | 4            | 3            | ×0,75             |
-| Perfil 1 (Leitura) | GET /vets        | 4,8            | 3,4            | ×0,71               | 7            | 4            | ×0,59             |
-| Perfil 1 (Leitura) | POST /owners     | 3,8            | 2,7            | ×0,71               | 5            | 4            | ×0,80             |
+| Repetição | Leitura A | Leitura B | Leitura C | Escrita A | Escrita B | Escrita C |
+|---|---|---|---|---|---|---|
+| 1 | 0,0 | 0,0 | 0,0 | 0,0 | 0,0 | 0,0 |
+| 2 | 0,0 | 0,5 | 96,1 | 0,0 | 0,1 | 93,7 |
+| 3 | 16,6 | 95,1 | 98,1 | 0,0 | 89,5 | 97,8 |
+| 4 | 92,4 | 98,4 | 99,0 | 20,7 | 97,1 | 98,6 |
+| 5 | 95,9 | 98,9 | 98,7 | 0,4 | 96,1 | 98,7 |
+| 6 | 96,8 | 99,1 | 99,4 | 73,1 | 98,2 | 99,8 |
+| 7 | 99,8 | 99,9 | 99,9 | 99,5 | 99,9 | 99,9 |
+| 8 | 99,8 | 99,9 | 99,9 | 99,6 | 99,9 | 99,9 |
+| 9 | 99,8 | 100,0 | 99,8 | 99,7 | 99,9 | 99,9 |
+| 10 | 99,9 | 99,9 | 99,9 | 99,7 | 99,9 | 100,0 |
 
-![Tempo médio por operação no cenário C](results/graficos/endpoints_cenario_c.png)
+Tipos de falha, somando todas as execuções (arquivos `locust/*_failures.csv`):
 
-*Escala logarítmica. No Perfil 2, `GET /owners/{id}` e `POST /owners` têm praticamente o mesmo tempo
-(57,9 e 57,7 ms), apesar de serem operações diferentes (ver 6.4).*
-
-![Degradação por operação](results/graficos/degradacao.png)
-
-O tamanho médio da resposta do `GET /owners` mostra o banco crescendo com os POSTs:
-
-| | Cenário A | Cenário B | Cenário C |
+| Operação | 405 (fallback) | 503 (fallback) | Outras |
 |---|---|---|---|
-| Perfil 1 (Leitura) | 25 KB | 65 KB | 117 KB |
-| Perfil 2 (Escrita) | 192 KB | 504 KB | 903 KB |
+| GET /owners | 230.593 | 0 | 0 |
+| GET /owners/{id} | 193.044 | 0 | 21 (18 × 400, 3 × 500) |
+| GET /vets | 119.456 | 0 | 0 |
+| POST /owners | 0 | 156.971 | 0 |
 
-![GET /owners ao longo da execução no cenário C](results/graficos/get_owners_tempo.png)
+Praticamente todas as falhas (99,997%) são respostas do fallback do circuit breaker do gateway, inclusive as
+119.456 do `GET /vets`, que é atendido por outro serviço (o vets-service ficou abaixo de 1% de CPU).
 
-*Mediana móvel (janela de 10 s) do `GET /owners` no cenário C, média das 10 repetições. No Perfil 2, ela vai
-de 75 ms nos primeiros 30 s da medição para 1.141 ms nos últimos 30 s (×15).*
+### 6.3 Por operação
 
-### 6.3 Uso de CPU
+Média das 10 repetições ([`results/media.csv`](results/media.csv)):
 
-CPU média de cada container durante a medição, em % de **um** núcleo:
+| Perfil | Operação | Tempo médio A (ms) | Tempo médio B (ms) | Tempo médio C (ms) | Falhas A (%) | Falhas B (%) | Falhas C (%) |
+|---|---|---|---|---|---|---|---|
+| Leitura | GET /owners | 1.013,2 | 883,5 | 231,5 | 70,9 | 79,7 | 89,5 |
+| Leitura | GET /owners/{id} | 527,4 | 645,7 | 201,8 | 70,3 | 79,2 | 89,3 |
+| Leitura | GET /vets | 2,3 | 2,0 | 1,7 | 67,0 | 77,6 | 87,6 |
+| Leitura | POST /owners | 470,8 | 664,4 | 186,2 | 70,4 | 79,1 | 89,2 |
+| Escrita | GET /owners | 769,9 | 992,2 | 572,7 | 50,2 | 79,3 | 89,6 |
+| Escrita | GET /owners/{id} | 178,1 | 534,6 | 395,9 | 49,6 | 78,2 | 89,0 |
+| Escrita | GET /vets | 2,5 | 2,0 | 1,8 | 48,0 | 76,6 | 87,4 |
+| Escrita | POST /owners | 173,6 | 532,3 | 405,4 | 49,3 | 78,2 | 89,1 |
 
-| Perfil             | Cenário          | api-gateway   | customers-service   | vets-service   | tracing-server   | config-server   | discovery-server   | visits-service   |
-|:-------------------|:-----------------|:--------------|:--------------------|:---------------|:-----------------|:----------------|:-------------------|:-----------------|
-| Perfil 1 (Leitura) | A · 30 usuários  | 5,7 ± 0,2     | 15,9 ± 1,0          | 2,6 ± 0,1      | 0,6 ± 0,0        | 0,6 ± 0,0       | 1,2 ± 0,0          | 0,7 ± 0,0        |
-| Perfil 1 (Leitura) | B · 80 usuários  | 9,2 ± 0,2     | 61,8 ± 1,3          | 3,3 ± 0,2      | 0,6 ± 0,0        | 0,6 ± 0,0       | 1,2 ± 0,0          | 0,7 ± 0,0        |
-| Perfil 1 (Leitura) | C · 150 usuários | 16,4 ± 0,4    | 140,4 ± 2,6         | 4,3 ± 0,2      | 0,6 ± 0,0        | 0,6 ± 0,0       | 1,2 ± 0,0          | 0,7 ± 0,0        |
-| Perfil 2 (Escrita) | A · 30 usuários  | 6,2 ± 0,2     | 33,7 ± 1,4          | 2,9 ± 0,1      | 0,6 ± 0,0        | 0,6 ± 0,0       | 1,2 ± 0,0          | 0,7 ± 0,1        |
-| Perfil 2 (Escrita) | B · 80 usuários  | 14,2 ± 0,3    | 157,5 ± 5,1         | 3,7 ± 0,2      | 0,6 ± 0,0        | 0,6 ± 0,0       | 1,3 ± 0,0          | 0,7 ± 0,0        |
-| Perfil 2 (Escrita) | C · 150 usuários | 32,2 ± 0,6    | 494,6 ± 11,2        | 5,8 ± 0,3      | 0,6 ± 0,0        | 0,7 ± 0,0       | 1,4 ± 0,0          | 0,8 ± 0,0        |
+![Degradação das operações](results/graficos/degradacao.png)
+
+*Tempo médio no cenário C dividido pelo tempo médio no cenário A. Valores abaixo de 1 significam que o
+cenário C ficou mais rápido, o que aqui acontece porque ele teve mais respostas rápidas de erro.*
+
+### 6.4 Uso de CPU
+
+CPU média de cada serviço durante a medição, em % de **um** núcleo ([`results/media_cpu.csv`](results/media_cpu.csv)):
+
+| Perfil | Cenário | api-gateway | customers-service | vets-service |
+|---|---|---|---|---|
+| Perfil 1 (Leitura) | A (30 usuários) | 6,1 | 249,5 | 0,8 |
+| Perfil 1 (Leitura) | B (80 usuários) | 6,3 | 244,2 | 0,8 |
+| Perfil 1 (Leitura) | C (150 usuários) | 7,4 | 212,6 | 0,9 |
+| Perfil 2 (Escrita) | A (30 usuários) | 7,6 | 194,0 | 0,8 |
+| Perfil 2 (Escrita) | B (80 usuários) | 6,8 | 251,2 | 0,8 |
+| Perfil 2 (Escrita) | C (150 usuários) | 7,8 | 270,3 | 0,8 |
 
 ![CPU do customers-service](results/graficos/cpu_customers-service.png)
 
@@ -332,155 +333,98 @@ CPU média de cada container durante a medição, em % de **um** núcleo:
 
 ![CPU do vets-service](results/graficos/cpu_vets-service.png)
 
-### 6.4 Diagnóstico do customers-service (Perfil 2, cenário C)
-
-Para explicar por que operações baratas (`GET /owners/{id}`, `POST /owners`) ficaram lentas no Perfil 2,
-cenário C, uma execução extra com a mesma configuração ([`app/diagnostico.py`](app/diagnostico.py)) consultou
-o Actuator do customers-service a cada 5 s. O pool de conexões do banco (HikariCP) tem **10 conexões**, o
-padrão do Spring Boot. Essa execução teve tempo médio de 124 ms, dentro da faixa das 10 repetições da
-bateria (85 a 137 ms), então é representativa.
-
-| Minuto da medição   | Conexões ativas (média, de 10)   | Threads esperando conexão (média / máx.)   | Espera por conexão (ms)   | Tempo com a conexão (ms)   | Tempo em pausa de GC (%)   |
-|:--------------------|:---------------------------------|:-------------------------------------------|:--------------------------|:---------------------------|:---------------------------|
-| 1                   | 1,2                              | 0,0 / 0                                    | 0,0                       | 21,8                       | 2,8                        |
-| 2                   | 3,0                              | 0,0 / 0                                    | 0,1                       | 35,6                       | 5,4                        |
-| 3                   | 3,3                              | 0,0 / 0                                    | 0,1                       | 48,5                       | 8,6                        |
-| 4                   | 5,0                              | 0,4 / 3                                    | 6,6                       | 71,1                       | 13,1                       |
-| 5                   | 6,5                              | 5,4 / 22                                   | 74,8                      | 114,9                      | 18,7                       |
-| 6                   | 9,6                              | 17,9 / 28                                  | 393,1                     | 189,8                      | 26,1                       |
-
-![Pool de conexões e espera no customers-service](results/diagnostico/diagnostico.png)
-
-Conforme a tabela cresce, cada `GET /owners` segura uma conexão por mais tempo (de 22 para 190 ms). No último
-minuto, o pool fica praticamente todo ocupado, em média 18 threads esperam uma conexão, e a espera chega a
-393 ms, a mesma ordem de grandeza do P95 de `GET /owners/{id}` (442 ms) e `POST /owners` (444 ms).
-Ao mesmo tempo, a JVM passa 26% do tempo parada em coleta de lixo, por causa das listas enormes montadas a
-cada `GET /owners`. Nessa execução, a **mediana** de `GET /owners/{id}` e `POST /owners` continua em 3 ms:
-a degradação está concentrada na cauda, nos minutos finais.
-
 ## 7. Análise: respostas às questões
 
 **1. Como o aumento de usuários afeta o tempo de resposta?**
 
-O tempo de resposta aumenta nos dois perfis, mas de formas bem diferentes:
+Nas médias das 10 repetições, o tempo de resposta **não acompanha** o número de usuários: no Perfil 1 ele vai
+de 666,7 ms (A) para 184,6 ms (C), e no Perfil 2 de 259,0 ms para 519,7 ms e depois 355,9 ms. Isso não reflete a
+aplicação, e sim a proporção de falhas: as respostas do fallback levam poucos milissegundos, e quanto mais
+falhas um cenário tem, mais a média cai (o C, com ~89% de falhas, tem as menores médias).
 
-- **Perfil 1 (Leitura): crescimento moderado e sublinear.** A média vai de 9,5 para 14,2 e depois 17,9 ms
-  (×1,9 de A para C, enquanto os usuários aumentam ×5). O P95 vai de 25 para 44 e depois 55 ms.
-- **Perfil 2 (Escrita): crescimento acelerado.** A média vai de 20,0 para 32,9 e depois 106,8 ms: ×1,6 de A
-  para B, mas ×3,2 de B para C. O P95 vai de 112 para 191 e depois 620 ms. No cenário C, o desvio-padrão
-  entre repetições também sobe (±13,5 ms na média, ±94 ms no P95), sinal de que o sistema está perto do limite.
+Na repetição 1, em que não houve falhas, o efeito esperado aparece com clareza:
 
-A causa não é falta de CPU na máquina: no pior caso, o customers-service usou cerca de 5 dos 32 núcleos. O
-que piora é o `GET /owners`, que devolve **todos** os owners, sem paginação e carregando os pets em modo
-EAGER. Mais usuários significam mais `POST /owners` por segundo, uma tabela maior e, portanto, um `GET /owners`
-mais caro. A resposta média dele passa de 25 para 117 KB no Perfil 1 e de 192 para 903 KB no Perfil 2. Como
-crescem juntos a frequência de `GET /owners` e o custo de cada um, o trabalho total cresce mais rápido que o
-número de usuários. A piora também acontece *dentro* de cada execução: no Perfil 2, cenário C, a mediana do
-`GET /owners` vai de 75 ms no início da medição para 1.141 ms no fim.
+- **Perfil 1:** o tempo médio sobe de 9,6 para 19,6 e depois 32,3 ms, e o P95 de 26 para 58 e depois 92 ms.
+  O crescimento vem quase todo do `GET /owners` (17,1 → 40,9 → 69,6 ms); as demais operações ficam estáveis.
+- **Perfil 2:** sobe de 44,9 para 65,1 ms e salta para 1.991,2 ms no cenário C (P95 de 4,7 s). O `GET /owners`
+  vai de 210,8 para 3.498,0 ms. Esse salto mistura dois efeitos: mais usuários e um banco maior, já que a
+  Escrita C rodou depois de outras cinco execuções.
 
-Um detalhe: no Perfil 1, as operações que não dependem do tamanho da tabela ficaram **mais rápidas** com mais
-usuários (`GET /owners/{id}` de 3,0 para 2,3 ms, `GET /vets` de 4,8 para 3,4 ms). O mais provável é que, com
-carga baixa, a JVM e a CPU fiquem "frias" entre uma requisição e outra (núcleos em economia de energia, código
-menos otimizado pelo JIT), e que a carga contínua mantenha esse caminho aquecido.
+Ou seja, mais usuários aumentam o tempo de resposta, e o efeito é muito mais forte no perfil de escrita,
+porque os POSTs aumentam a tabela que o `GET /owners` devolve inteira a cada chamada.
 
 **2. Qual perfil apresenta maior vazão?**
 
-O **Perfil 1 (Leitura)**, em todos os cenários, mas por pouco: 14,90 contra 14,83 req/s no A (+0,5%), 39,60
-contra 39,26 no B (+0,9%) e 74,04 contra 70,97 no C (+4,3%). O total de requisições segue a mesma proporção
-(26.626 contra 25.474 por execução no cenário C).
+Nas médias, os dois perfis ficaram muito próximos: 12,07 contra 13,33 req/s no A, 34,06 contra 34,38 no B e
+68,88 contra 65,99 no C (Leitura contra Escrita). A vazão cresceu quase na proporção dos usuários, porque cada
+usuário espera de 1 a 3 s entre requisições: pela lei de Little, a vazão é `N / (Z + R)`, com N usuários,
+pausa média Z = 2 s e tempo de resposta R. Na repetição 1, o modelo explica os números: na Leitura C,
+150 / (2 + 0,032) = 73,8 req/s previstos contra 73,4 medidos; na Escrita C, 150 / (2 + 1,991) = 37,6 previstos
+contra 37,3 medidos.
 
-A diferença é pequena porque o teste é um **sistema fechado**: cada usuário espera a resposta e depois pausa
-de 1 a 3 s (média Z = 2 s) antes da próxima requisição. Pela lei de Little, a vazão é `X = N / (Z + R)`, em
-que N é o número de usuários e R é o tempo de resposta. O modelo prevê os resultados com erro de até 0,4%:
-
-| Configuração | Previsto `N / (2 s + R)` | Medido |
-|---|---|---|
-| Leitura A / B / C | 14,93 / 39,72 / 74,34 req/s | 14,90 / 39,60 / 74,04 req/s |
-| Escrita A / B / C | 14,85 / 39,35 / 71,20 req/s | 14,83 / 39,26 / 70,97 req/s |
-
-Ou seja, a vazão é ditada pelo número de usuários e pelo tempo de pausa, e o perfil só interfere por meio de R.
-Como R é maior no Perfil 2 (106,8 contra 17,9 ms no cenário C), a vazão dele é um pouco menor. Se R se
-aproximasse de Z (o `GET /owners` já chega a 1,2 s de P95 no Perfil 2, cenário C), a diferença cresceria
-rapidamente. Nos dois perfis, a vazão aumentou quase na mesma proporção dos usuários (×5,0 e ×4,8 de A para C):
-o sistema não chegou a saturar em vazão.
+Na repetição 1, sem falhas, o **Perfil 1 (Leitura) teve maior vazão** em todos os cenários: 14,9, 39,6 e
+73,4 req/s, contra 14,6, 38,6 e 37,3 do Perfil 2. No cenário C, a vazão da escrita caiu à metade porque o tempo
+de resposta (~2 s) ficou tão grande quanto a pausa dos usuários. Nas médias, a vazão inclui as requisições que
+falharam; contando só as bem-sucedidas, ela fica entre 3,4 e 7,9 req/s em todas as configurações.
 
 **3. Quais operações apresentam maior degradação?**
 
-- **`GET /owners` é a origem da degradação** e a única operação que piora no Perfil 1: média de 16,8 para
-  36,4 ms (×2,2). No Perfil 2, vai de 86,3 para 360,3 ms (×4,2) e o P95 de 151 para 1.232 ms (×8,2), o maior
-  tempo absoluto do experimento. O custo dela é proporcional ao número de owners no banco (seção 6.2).
-- **Proporcionalmente, `GET /owners/{id}` e `POST /owners` são as que mais degradam**, no Perfil 2: ×18,5 e
-  ×17,8 na média, e o P95 de ambas passa de 4 para ~440 ms (×110). As duas são baratas (busca por chave
-  primária e insert, ~3 ms sem disputa) e pioram **por contágio**: dividem o customers-service com o
-  `GET /owners`. O diagnóstico da seção 6.4 mostra o mecanismo: no último minuto, o pool de 10 conexões do
-  banco fica saturado, em média 18 threads esperam uma conexão e a espera chega a 393 ms. A JVM ainda passa
-  26% do tempo em GC. Por isso as duas operações têm tempos praticamente idênticos: elas esperam na mesma fila.
-- **`GET /vets` não degradou** (×0,87 no Perfil 2; P95 de 7 para 5 ms), mesmo passando pelo mesmo gateway. Isso
-  mostra que o gargalo está no customers-service, não no gateway: a lentidão contaminou todas as operações do
-  mesmo serviço, mas não se propagou para a rota de outro.
+- **`GET /owners` é a origem da degradação.** Na repetição 1, ele foi a única operação que piorou no Perfil 1
+  (17,1 → 69,6 ms, ×4,1) e, no Perfil 2, foi de 210,8 para 3.498,0 ms (×16,6). Como não tem paginação e
+  carrega os pets em modo EAGER, o custo dele cresce com cada owner criado.
+- **`GET /owners/{id}` e `POST /owners` degradam por contágio no Perfil 2.** São operações baratas (~2,5 ms
+  no cenário A da repetição 1), mas chegaram a 2.116 e 2.182 ms no cenário C, porque dividem o
+  customers-service e o pool de conexões do banco com o `GET /owners`, que segura cada conexão por mais tempo
+  conforme a tabela cresce. Nas médias das 10 repetições, também são as que mais pioram do A para o C no
+  Perfil 2 (×2,2 e ×2,3, gráfico de degradação).
+- **`GET /vets` não degrada:** fica entre 1,7 e 4,5 ms em todos os casos, porque é atendido por outro serviço,
+  com cache. Mesmo assim, ele **falha** na mesma proporção das outras operações (até 87,6%), porque o circuit
+  breaker do gateway é compartilhado: a lentidão do customers-service derruba também a rota do vets-service.
+- Nas médias das 10 repetições, os fatores abaixo de 1 (por exemplo, `GET /owners` com ×0,2 no Perfil 1) não
+  indicam melhora: o cenário C teve mais falhas rápidas, que puxam a média para baixo.
 
 **4. Como o consumo de CPU varia entre os cenários?**
 
-- **O customers-service domina e cresce mais rápido que a carga.** No Perfil 1, vai de 15,9 para 61,8 e depois
-  140,4% (×8,8 para ×5 usuários); no Perfil 2, de 33,7 para 157,5 e depois 494,6% (×14,7), quase 5 núcleos.
-  A CPU gasta por requisição também sobe: de 10,7 para 19,0 ms no Perfil 1 e de 22,7 para 69,7 ms no Perfil 2.
-  Cada requisição fica mais cara porque o `GET /owners` processa mais linhas e porque há mais coleta de lixo
-  (26% do tempo em pausa de GC no fim da execução de diagnóstico).
-- **O api-gateway acompanha o volume de dados trafegados**: de 5,7 para 16,4% no Perfil 1 e de 6,2 para 32,2%
-  no Perfil 2. No cenário C, ele gasta o dobro de CPU no Perfil 2 com vazão parecida, porque repassa cerca de
-  12 MB/s só de `GET /owners` (14 req/s × 903 KB), contra cerca de 4 MB/s no Perfil 1 (33 req/s × 117 KB).
-- **O vets-service fica baixo** (de 2,6 a 5,8%), graças ao cache (`@Cacheable`).
-- **config-server, discovery-server, visits-service e tracing-server ficam constantes** (0,6 a 1,4%): é
-  atividade de fundo (heartbeats do Eureka, envio de traces). Eles não estão no caminho dos endpoints testados.
-
-No cenário mais pesado, todos os containers juntos usaram cerca de 5,4 dos 32 núcleos da máquina. O limite foi
-local, no customers-service (pool de conexões e GC), não a CPU do host.
+- **O customers-service concentra o consumo.** Nas médias, ele fica entre 194 e 270% (2 a 2,7 núcleos) sem
+  tendência clara entre os cenários, porque, com ~85% das requisições recusadas pelo gateway, quem chega ao
+  serviço é uma parcela pequena, mas cada `GET /owners` sobre uma tabela enorme é muito caro.
+- **Na repetição 1, a CPU cresce fortemente com os usuários:** de 15,8 para 85,1 e 265,2% no Perfil 1, e de
+  77,2 para 332,5 e 924,8% no Perfil 2 (mais de 9 núcleos no cenário C). O Perfil 2 consome bem mais, por causa
+  do custo crescente do `GET /owners`.
+- **O api-gateway** fica em torno de 6 a 8% nas médias (5 a 34% na repetição 1). Responder pelo fallback é barato.
+- **O vets-service** fica abaixo de 1% nas médias (até 3,5% na repetição 1), graças ao cache e às requisições
+  barradas no gateway.
 
 **5. Qual cenário apresenta maior taxa de falhas?**
 
-**Nenhum**: houve 0 falhas em 911.251 requisições, ou seja, taxa de 0% nos três cenários dos dois perfis, e
-nenhum container parou ou sofreu OOM. A carga, limitada pelo tempo de pausa dos usuários (no máximo ~74 req/s),
-não chegou a provocar erros: a resposta mais lenta da bateria levou 2,9 s (Perfil 2, cenário C), bem abaixo do
-timeout de 10 s do circuit breaker do gateway, que por isso nunca abriu.
+O **cenário C**, nos dois perfis: 89,1% no Perfil 1 e 88,8% no Perfil 2, contra 79,2% e 78,1% no B e 70,1% e
+49,3% no A. Mas a tabela da seção 6.2 mostra que as falhas não são causadas só pelo número de usuários:
 
-O cenário **mais próximo de falhar é o C do Perfil 2**: o pool de conexões já estava saturado no fim das
-execuções e o tempo do `GET /owners` crescia cada vez mais rápido (gráfico da seção 6.2). Por inferência, não
-medida: numa execução mais longa, a tabela continuaria crescendo até o `GET /owners` passar de 10 s. Nesse
-ponto, o gateway cortaria as requisições e responderia 503 pelo fallback. Como o circuit breaker é único para
-todas as rotas, ele poderia abrir e derrubar até o `GET /vets`.
+- na **repetição 1, nenhum cenário falhou**;
+- o C é o primeiro a falhar (já na repetição 2), seguido do B (repetição 3) e do A (repetições 3 e 4);
+- a partir da **repetição 7, todos os cenários ficam acima de 99%**.
 
-Vale registrar que, no piloto com a configuração original (seção 5.4), o cenário B do Perfil 1 teve 100% de
-falhas. A causa era de ambiente (OOM do gateway por a JVM não enxergar o limite de memória), não de capacidade
-da aplicação.
+As falhas são respostas do fallback do circuit breaker (405 nos GET e 503 no POST). Com os owners acumulando
+entre as execuções, o `GET /owners` fica lento a ponto de passar do limite de 10 s do gateway (no fim da
+repetição 1 ele já levava 3,5 s em média na Escrita C). Quando mais da metade das últimas 100 chamadas falha, o
+circuito abre e recusa todas as rotas. O C falha primeiro porque tem mais usuários fazendo `GET /owners` ao mesmo
+tempo e porque, em cada repetição, roda depois do A e do B, com o banco ainda maior.
 
 ## 8. Conclusões
 
-1. **O perfil de leitura escala bem no intervalo testado.** Com 5× mais usuários, a vazão aumentou 5×, o tempo
-   médio ficou abaixo de 18 ms, o P95 abaixo de 55 ms e não houve falhas.
-2. **O perfil de escrita degrada de forma acelerada, mas não por causa do custo das escritas**, que levam ~3 ms
-   sem disputa. O problema é o efeito delas sobre uma leitura sem paginação: cada `POST /owners` deixa todos os
-   `GET /owners` seguintes mais caros. Esse é o principal problema de desempenho da aplicação, e é de projeto
-   (endpoint que devolve a tabela inteira com N+1 consultas), não de infraestrutura.
-3. **O gargalo é localizado no customers-service**: CPU, pool de 10 conexões e coleta de lixo. O gateway e o
-   vets-service continuaram estáveis. O isolamento entre microsserviços funcionou entre serviços diferentes,
-   mas dentro de um mesmo serviço a operação lenta contaminou as rápidas pela disputa de conexões.
-4. **Em testes com usuários e tempo de pausa, a vazão quase não distingue os perfis**, porque segue o modelo de
-   sistema fechado. Quem mostra a diferença são o tempo de resposta e, principalmente, o P95.
-5. **Melhorias sugeridas para a aplicação:** paginar o `GET /owners`; trocar o EAGER/N+1 por `JOIN FETCH` ou
-   projeção em DTO; isolar a operação pesada com um pool ou limite de concorrência próprio (*bulkhead*); e
-   usar circuit breakers por rota no gateway.
-6. **O teste piloto foi essencial.** Três problemas de ambiente (latência do `localhost` no Windows, JVM sem
-   enxergar o limite de memória no WSL 2 e contaminação entre execuções via circuit breaker) teriam produzido
-   medições erradas ou 100% de falhas sem relação com a aplicação.
+Os resultados indicam que o sistema opera de forma estável enquanto o volume de dados é pequeno. Na primeira
+repetição, nenhum cenário teve falhas, e o perfil de leitura manteve tempos baixos mesmo com 150 usuários
+(32,3 ms de média). No perfil de escrita, o cenário C já ultrapassa o ponto de operação estável, com cerca de
+2 s de tempo médio e a vazão reduzida à metade. Com o acúmulo de dados ao longo da bateria, sem reinício entre as
+execuções, todos os cenários passaram a falhar, e o cenário C, por ter mais usuários e rodar depois do A e do B
+em cada repetição, apresentou a maior taxa de falhas.
 
-## 9. Limitações
-
-- Gerador de carga e aplicação na mesma máquina: o Locust disputa CPU com os containers.
-- Containers sem limite de CPU (só de memória, 1 GiB), então os serviços podem usar todos os núcleos da
-  máquina, diferente de um ambiente de produção com cotas.
-- Banco HSQLDB em memória: o comportamento com MySQL/PostgreSQL em disco seria diferente.
-- Os resultados valem para o tempo de reflexão escolhido (1 a 3 s): sem pausas, os mesmos números de
-  usuários gerariam carga bem maior.
-- No Perfil 2, o estado acumula durante a execução (a tabela cresce), então os resultados dependem da duração
-  de 7 min. Execuções mais longas mostrariam degradação maior.
-- O diagnóstico da seção 6.4 é uma única execução, usada para explicar o mecanismo, não para medir.
+O customers-service concentra o consumo de CPU, e as operações de listagem, busca e criação de owners são as
+mais sensíveis à carga: o `GET /owners`, sem paginação, fica mais caro a cada owner criado e arrasta as demais
+operações do serviço, enquanto o circuit breaker compartilhado do gateway estende as falhas até o `GET /vets`.
+A maior vazão nominal foi obtida no cenário C (68,88 req/s na leitura e 65,99 req/s na escrita), mas não deve
+ser considerada ganho de desempenho, pois foi acompanhada por cerca de 89% de falhas: contando só as requisições
+bem-sucedidas, a vazão nesse cenário ficou em 7,9 e 4,4 req/s. Como próximo passo, seria recomendável
+investigar os limites do pool de conexões do banco, os timeouts e o circuit breaker do gateway e os recursos do
+customers-service, adicionar paginação ao `GET /owners` e repetir os testes reiniciando a aplicação entre as
+execuções, para comparar a capacidade sustentável de requisições bem-sucedidas.
