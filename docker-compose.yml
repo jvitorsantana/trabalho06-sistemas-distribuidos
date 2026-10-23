@@ -1,0 +1,178 @@
+name: petclinic
+
+x-java-env: &java-env
+  JAVA_TOOL_OPTIONS: "-XX:MaxRAM=1g"
+
+services:
+  config-server:
+    image: springcommunity/spring-petclinic-config-server:3.4.1
+    container_name: config-server
+    environment: *java-env
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    healthcheck:
+      test: ["CMD", "curl", "-I", "http://config-server:8888"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - 8888:8888
+
+  discovery-server:
+    image: springcommunity/spring-petclinic-discovery-server:3.4.1
+    container_name: discovery-server
+    environment: *java-env
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://discovery-server:8761"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    depends_on:
+      config-server:
+        condition: service_healthy
+    ports:
+      - 8761:8761
+
+  customers-service:
+    image: springcommunity/spring-petclinic-customers-service:3.4.1
+    container_name: customers-service
+    environment: *java-env
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/actuator/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+    depends_on:
+      config-server:
+        condition: service_healthy
+      discovery-server:
+        condition: service_healthy
+    ports:
+      - 8081:8081
+
+  visits-service:
+    image: springcommunity/spring-petclinic-visits-service:3.4.1
+    container_name: visits-service
+    environment: *java-env
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8082/actuator/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+    depends_on:
+      config-server:
+        condition: service_healthy
+      discovery-server:
+        condition: service_healthy
+    ports:
+      - 8082:8082
+
+  vets-service:
+    image: springcommunity/spring-petclinic-vets-service:3.4.1
+    container_name: vets-service
+    environment: *java-env
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8083/actuator/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+    depends_on:
+      config-server:
+        condition: service_healthy
+      discovery-server:
+        condition: service_healthy
+    ports:
+      - 8083:8083
+
+  api-gateway:
+    image: springcommunity/spring-petclinic-api-gateway:3.4.1
+    container_name: api-gateway
+    environment: *java-env
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+    depends_on:
+      config-server:
+        condition: service_healthy
+      discovery-server:
+        condition: service_healthy
+    ports:
+      - 8080:8080
+
+  tracing-server:
+    image: openzipkin/zipkin:3.5
+    container_name: tracing-server
+    environment: *java-env
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    ports:
+      - 9411:9411
+
+  admin-server:
+    image: springcommunity/spring-petclinic-admin-server:3.4.1
+    container_name: admin-server
+    environment: *java-env
+    profiles: [monitoring]
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    depends_on:
+      config-server:
+        condition: service_healthy
+      discovery-server:
+        condition: service_healthy
+    ports:
+      - 9090:9090
+
+  grafana-server:
+    build: https://github.com/spring-petclinic/spring-petclinic-microservices.git#v3.4.1:docker/grafana
+    container_name: grafana-server
+    profiles: [monitoring]
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    ports:
+      - 3030:3000
+
+  prometheus-server:
+    build: https://github.com/spring-petclinic/spring-petclinic-microservices.git#v3.4.1:docker/prometheus
+    container_name: prometheus-server
+    profiles: [monitoring]
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    ports:
+      - 9091:9090
