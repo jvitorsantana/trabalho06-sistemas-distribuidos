@@ -1,12 +1,12 @@
 # Trabalho Prático 06: Avaliação de Desempenho de Microsserviços com Locust
 
-**Disciplina:** Sistemas Distribuídos (UFPI) · **Aluno:** João Vitor
+**Disciplina:** Sistemas Distribuídos · **Aluno:** João Vitor Santana Lima (20249006849)
 
 Avaliação de desempenho do [Spring PetClinic Microservices](https://github.com/spring-petclinic/spring-petclinic-microservices)
 com o [Locust](https://locust.io), analisando o impacto da quantidade de usuários e do tipo de requisição
 (perfil de leitura e perfil de escrita) sobre tempo de resposta, vazão, falhas e uso de CPU.
 
-**Vídeo demonstrativo:** TODO: colar o link do vídeo (4 a 6 min)
+**Vídeo demonstrativo:** https://youtu.be/TvblQbSfHy4
 
 ---
 
@@ -188,12 +188,6 @@ são exatamente as porcentagens do enunciado:
   1º minuto. O `_stats.csv` final de cada execução, inclusive a vazão, reflete só os 6 min de medição. Todos os
   usuários já estão ativos antes do fim do aquecimento (150 usuários a 10/s = 15 s).
 - **Ordem intercalada:** repetição → perfil → cenário (rep 1: Leitura A, B, C, Escrita A, B, C; rep 2: ...).
-- **Sem reinício entre execuções:** a aplicação é iniciada **uma única vez**, antes da primeira execução
-  (`docker compose down` + `up --wait`). Em seguida, o script espera o gateway responder corretamente 5 vezes
-  seguidas e faz 100 chamadas ao `GET /vets` para limpar a janela do circuit breaker (ver [5.4](#54-teste-piloto-e-ajustes)).
-  As 59 execuções seguintes usam a mesma instância: os owners criados pelos POSTs **se acumulam** no banco em
-  memória, e o estado do circuit breaker passa de uma execução para a seguinte. A escolha reduziu a bateria
-  de ~8,5 h para ~7 h. O efeito disso nos resultados é analisado na [seção 6](#6-resultados).
 - **CPU:** o `docker stats` amostra o api-gateway, o customers-service e o vets-service durante toda a
   execução (~1 amostra a cada 2 s por serviço); só as amostras após o aquecimento entram na média. A CPU é
   medida em % de **um** núcleo (200% = dois núcleos inteiros).
@@ -228,21 +222,13 @@ Antes da bateria, testes curtos revelaram três problemas no ambiente, todos cor
    `-XX:MaxRAM=1g` (heap máximo de 256 MiB, 25% do limite, como num Linux nativo) e manter o limite em 1 GiB,
    para dar folga à memória fora do heap.
 3. **Falhas da subida "contaminavam" o circuit breaker.** Enquanto a aplicação sobe, a checagem de prontidão
-   gera falhas que ficam guardadas na janela de 100 chamadas do circuit breaker (o endpoint
-   `/actuator/circuitbreakers` mostrou cerca de 25 falhas em 35 chamadas logo após a subida). Quando a carga
-   começava, essas falhas antigas podiam abrir o circuito no primeiro segundo, gerando 100% de falhas sem relação
-   com o teste. A correção foram as 100 chamadas ao `GET /vets` depois da prontidão, que empurram as falhas para
-   fora da janela (o mesmo endpoint passou a mostrar 0 falhas em 100 chamadas).
+   gera falhas que ficam guardadas na janela de 100 chamadas do circuit breaker. Quando a carga começava, essas falhas antigas podiam abrir o circuito no primeiro segundo, gerando 100% de falhas sem relação
+   com o teste. A correção foram as 100 chamadas ao `GET /vets` depois da prontidão, que empurram as falhas para fora da janela (o mesmo endpoint passou a mostrar 0 falhas em 100 chamadas).
 
 ## 6. Resultados
 
 As 60 execuções foram concluídas e somaram **821.208 requisições, das quais 700.085 falharam (85,3%)**. Os
 valores são a média das 10 repetições, só na janela de medição de 6 min.
-
-> **Atenção ao ler os resultados.** Como a aplicação não foi reiniciada entre as execuções, os owners criados
-> se acumularam no banco e, a partir da 2ª ou 3ª repetição, o circuit breaker passou a recusar a maior parte
-> das requisições (seção 6.2). As respostas de erro do fallback são muito rápidas e entram nas médias de tempo
-> e de vazão. Por isso, a seção 6.5 mostra também a repetição 1, a única em que nenhum cenário teve falhas.
 
 ### 6.1 Visão geral
 
